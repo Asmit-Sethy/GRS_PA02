@@ -8,92 +8,107 @@ MESSAGE_SIZES=(1024 4096 16384 65536)
 THREAD_COUNTS=(1 2 4 8)
 OUTPUT_CSV="MT25020_Part_C_Results.csv"
 
-# 1. Setup Network Namespaces
-echo "Setting up network namespaces..."
-# Clean up old namespaces if they exist
-sudo ip netns del ns_server 2>/dev/null
-sudo ip netns del ns_client 2>/dev/null
+# --- 0. FORCE PERF PERMISSIONS ---
+# Try to unblock hardware counters automatically
+sysctl -w kernel.perf_event_paranoid=-1 2>/dev/null
 
-# Create new namespaces
-sudo ip netns add ns_server
-sudo ip netns add ns_client
+# --- NETWORK NAMESPACE SETUP ---
+setup_namespaces() {
+    echo "Setting up network namespaces..."
+    ip netns del ns_server 2>/dev/null
+    ip netns del ns_client 2>/dev/null
 
-# Create veth pair
-sudo ip link add veth-server type veth peer name veth-client
+    ip netns add ns_server
+    ip netns add ns_client
 
-# Plug ends into namespaces
-sudo ip link set veth-server netns ns_server
-sudo ip link set veth-client netns ns_client
+    ip link add veth_server type veth peer name veth_client
 
-# Assign IPs and bring interfaces UP
-sudo ip netns exec ns_server ip addr add 10.0.0.1/24 dev veth-server
-sudo ip netns exec ns_server ip link set veth-server up
-sudo ip netns exec ns_server ip link set lo up
+    ip link set veth_server netns ns_server
+    ip link set veth_client netns ns_client
 
-sudo ip netns exec ns_client ip addr add 10.0.0.2/24 dev veth-client
-sudo ip netns exec ns_client ip link set veth-client up
-sudo ip netns exec ns_client ip link set lo up
+    ip netns exec ns_server ip addr add 10.0.0.1/24 dev veth_server
+    ip netns exec ns_server ip link set veth_server up
+    ip netns exec ns_server ip link set lo up
 
-# Enable forwarding
-sudo sysctl -w net.ipv4.ip_forward=1 > /dev/null
+    ip netns exec ns_client ip addr add 10.0.0.2/24 dev veth_client
+    ip netns exec ns_client ip link set veth_client up
+    ip netns exec ns_client ip link set lo up
+    
+    # Enable offloading
+    ip netns exec ns_client ethtool -K veth_client sg on tso on 2>/dev/null
+    ip netns exec ns_server ethtool -K veth_server sg on tso on 2>/dev/null
+}
 
-# 2. Compile Code
-echo "Compiling..."
+cleanup_namespaces() {
+    echo "Cleaning up namespaces..."
+    ip netns del ns_server 2>/dev/null
+    ip netns del ns_client 2>/dev/null
+}
+
+# --- COMPILE ---
+echo "Compiling implementations..."
 make clean
 make all
 
-# CSV Header (Restored LLCMisses as per assignment)
+setup_namespaces
+
+# Initialize CSV with correct hardware headers
 echo "Impl,MsgSize,Threads,ThroughputGbps,LatencyUs,CPUCycles,L1Misses,LLCMisses,ContextSwitches" > $OUTPUT_CSV
 
+# Function to run experiment
 run_experiment() {
     local impl=$1
     local msg_size=$2
     local num_threads=$3
     
-    echo "Running $impl: Size=$msg_size, Threads=$num_threads"
+    echo "Running $impl with message_size=$msg_size, threads=$num_threads"
     
-    # Kill zombies globally and inside namespace
-    sudo ip netns exec ns_server killall -9 MT25020_Part_A1_Server MT25020_Part_A2_Server MT25020_Part_A3_Server 2>/dev/null
-    sudo killall -9 MT25020_Part_A1_Server MT25020_Part_A2_Server MT25020_Part_A3_Server 2>/dev/null
-    sleep 1
-
-    # 3. Start Server INSIDE 'ns_server' namespace
-    sudo ip netns exec ns_server ./MT25020_Part_${impl}_Server $msg_size $PORT &
+    # 1. Start Server pinned to Core 2 (P-Core) to separate it from client
+    ip netns exec ns_server taskset -c 2 ./MT25020_Part_${impl}_Server $msg_size $PORT &
     SERVER_PID=$!
     
-    sleep 2  # Wait for server to bind
-
-    # 4. Run Client INSIDE 'ns_client' namespace
-    # Using 'LLC-load-misses' as requested
-    CLIENT_OUTPUT=$(sudo ip netns exec ns_client perf stat -e cycles,L1-dcache-load-misses,LLC-load-misses,context-switches \
+    sleep 2
+    
+    # 2. Run Client pinned to Core 0 (P-Core)
+    # We ask for REAL hardware counters using the 'cpu_core' prefix for hybrid CPUs.
+    CLIENT_OUTPUT=$(ip netns exec ns_client taskset -c 0 perf stat \
+        -e cpu_core/cycles/,cpu_core/L1-dcache-load-misses/,cpu_core/LLC-load-misses/,context-switches \
         ./MT25020_Part_${impl}_Client $SERVER_IP $PORT $msg_size $num_threads 2>&1)
     
-    # 5. Cleanup
-    sudo kill -9 $SERVER_PID 2>/dev/null
+    # 3. Kill server
+    kill -9 $SERVER_PID 2>/dev/null
     wait $SERVER_PID 2>/dev/null
     
-    # 6. Parsing
+    # 4. Parsing Logic
     THROUGHPUT=$(echo "$CLIENT_OUTPUT" | grep "Throughput:" | awk '{print $2}')
     LATENCY=$(echo "$CLIENT_OUTPUT" | grep "Latency:" | awk '{print $2}')
     
-    # Robust perf parsing
-    CPUCycles=$(echo "$CLIENT_OUTPUT" | grep "cycles" | sed 's/,//g' | awk '{print $1}')
-    L1Misses=$(echo "$CLIENT_OUTPUT" | grep "L1-dcache-load-misses" | sed 's/,//g' | awk '{print $1}')
-    LLCMisses=$(echo "$CLIENT_OUTPUT" | grep "LLC-load-misses" | sed 's/,//g' | awk '{print $1}')
-    ContextSwitches=$(echo "$CLIENT_OUTPUT" | grep "context-switches" | sed 's/,//g' | awk '{print $1}')
+    # PERF PARSING
+    # 1. cpu_core/cycles/
+    CPU_CYCLES=$(echo "$CLIENT_OUTPUT" | grep "cpu_core/cycles/" | head -n 1 | sed 's/,//g' | awk '{print $1}')
     
-    # Defaults (Defaults to 0 if <not supported> occurs)
-    THROUGHPUT=${THROUGHPUT:-0}
-    LATENCY=${LATENCY:-0}
-    CPUCycles=${CPUCycles:-0}
-    L1Misses=${L1Misses:-0}
-    LLCMisses=${LLCMisses:-0}
-    ContextSwitches=${ContextSwitches:-0}
+    # 2. cpu_core/L1-dcache-load-misses/
+    L1_MISSES=$(echo "$CLIENT_OUTPUT" | grep "cpu_core/L1-dcache-load-misses/" | head -n 1 | sed 's/,//g' | awk '{print $1}')
+    
+    # 3. cpu_core/LLC-load-misses/
+    LLC_MISSES=$(echo "$CLIENT_OUTPUT" | grep "cpu_core/LLC-load-misses/" | head -n 1 | sed 's/,//g' | awk '{print $1}')
+    
+    # 4. Context Switches
+    CTX_SWITCHES=$(echo "$CLIENT_OUTPUT" | grep "context-switches" | head -n 1 | sed 's/,//g' | awk '{print $1}')
+    
+    # 5. Sanitize Zeros
+    if [[ "$CPU_CYCLES" == *"<"* ]] || [ -z "$CPU_CYCLES" ]; then CPU_CYCLES="0"; fi
+    if [[ "$L1_MISSES" == *"<"* ]] || [ -z "$L1_MISSES" ]; then L1_MISSES="0"; fi
+    if [[ "$LLC_MISSES" == *"<"* ]] || [ -z "$LLC_MISSES" ]; then LLC_MISSES="0"; fi
+    if [[ "$CTX_SWITCHES" == *"<"* ]] || [ -z "$CTX_SWITCHES" ]; then CTX_SWITCHES="0"; fi
 
-    echo "$impl,$msg_size,$num_threads,$THROUGHPUT,$LATENCY,$CPUCycles,$L1Misses,$LLCMisses,$ContextSwitches" >> $OUTPUT_CSV
+    THROUGHPUT=${THROUGHPUT:-0.0}
+    LATENCY=${LATENCY:-0.0}
+    
+    echo "$impl,$msg_size,$num_threads,$THROUGHPUT,$LATENCY,$CPU_CYCLES,$L1_MISSES,$LLC_MISSES,$CTX_SWITCHES" >> $OUTPUT_CSV
 }
 
-# Run Loop
+# Run all experiments
 for impl in "A1" "A2" "A3"; do
     for msg_size in "${MESSAGE_SIZES[@]}"; do
         for num_threads in "${THREAD_COUNTS[@]}"; do
@@ -102,9 +117,5 @@ for impl in "A1" "A2" "A3"; do
     done
 done
 
-# Cleanup Namespaces
-echo "Cleaning up namespaces..."
-sudo ip netns del ns_server
-sudo ip netns del ns_client
-
-echo "Done. Results in $OUTPUT_CSV"
+cleanup_namespaces
+echo "Results saved to $OUTPUT_CSV"

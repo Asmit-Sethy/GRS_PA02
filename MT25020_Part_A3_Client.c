@@ -21,7 +21,8 @@ void* client_thread(void* arg) {
         return NULL;
     }
     
-    char *buffer = (char*)malloc(args->message_size);
+    int field_size = args->message_size / NUM_FIELDS;
+    char *buffer = (char*)malloc(field_size);
     if (!buffer) {
         close(sock);
         return NULL;
@@ -37,17 +38,19 @@ void* client_thread(void* arg) {
     while (get_time_in_seconds() < end_time) {
         long long msg_start = get_time_in_microseconds();
         
-        ssize_t received = 0;
-        while (received < args->message_size) {
-            ssize_t n = recv(sock, buffer + received, args->message_size - received, 0);
-            if (n <= 0) {
-                free(buffer);
-                close(sock);
-                return NULL;
+        for (int i = 0; i < NUM_FIELDS; i++) {
+            ssize_t received = 0;
+            while (received < field_size) {
+                ssize_t n = recv(sock, buffer + received, field_size - received, 0);
+                if (n <= 0) {
+                    free(buffer);
+                    close(sock);
+                    return NULL;
+                }
+                received += n;
             }
-            received += n;
+            bytes_received += received;
         }
-        bytes_received += received;
         
         long long msg_end = get_time_in_microseconds();
         total_latency += (msg_end - msg_start);
@@ -57,7 +60,7 @@ void* client_thread(void* arg) {
     long long end_time_us = get_time_in_microseconds();
     double elapsed = (end_time_us - start_time) / 1000000.0;
     
-    args->throughput[args->thread_id] = (bytes_received * 8.0) / (elapsed * 1e9); // Gbps
+    args->throughput[args->thread_id] = (bytes_received * 8.0) / (elapsed * 1e9);
     args->latency[args->thread_id] = latency_count > 0 ? (double)total_latency / latency_count : 0;
     args->bytes_sent[args->thread_id] = bytes_received;
     
@@ -100,7 +103,6 @@ int main(int argc, char *argv[]) {
         pthread_join(threads[i], NULL);
     }
     
-    // Calculate aggregate statistics
     double total_throughput = 0;
     double avg_latency = 0;
     long long total_bytes = 0;
