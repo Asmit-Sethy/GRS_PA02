@@ -7,6 +7,50 @@
 #define SO_ZEROCOPY 60
 #endif
 
+// Helper: send full iovec handling partial sendmsg results
+static ssize_t send_iov_all_local(int sock, struct iovec *iov, int iovcnt, int flags) {
+    struct msghdr hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.msg_iov = iov;
+    hdr.msg_iovlen = iovcnt;
+
+    size_t total = 0;
+    for (int i = 0; i < iovcnt; i++) total += iov[i].iov_len;
+
+    size_t sent_total = 0;
+    while (sent_total < total) {
+        ssize_t n = sendmsg(sock, &hdr, flags);
+        if (n <= 0) return n;
+        sent_total += n;
+
+        size_t rem = n;
+        int idx = 0;
+        while (rem > 0 && idx < hdr.msg_iovlen) {
+            if (rem >= (size_t)hdr.msg_iov[idx].iov_len) {
+                rem -= hdr.msg_iov[idx].iov_len;
+                hdr.msg_iov[idx].iov_base = (char*)hdr.msg_iov[idx].iov_base + hdr.msg_iov[idx].iov_len;
+                hdr.msg_iov[idx].iov_len = 0;
+                idx++;
+            } else {
+                hdr.msg_iov[idx].iov_base = (char*)hdr.msg_iov[idx].iov_base + rem;
+                hdr.msg_iov[idx].iov_len -= rem;
+                rem = 0;
+            }
+        }
+
+        int new_cnt = 0;
+        for (int i = 0; i < iovcnt; i++) {
+            if (hdr.msg_iov[i].iov_len > 0) {
+                if (i != new_cnt) hdr.msg_iov[new_cnt] = hdr.msg_iov[i];
+                new_cnt++;
+            }
+        }
+        hdr.msg_iovlen = new_cnt;
+    }
+
+    return (ssize_t)sent_total;
+}
+
 #ifndef MSG_ZEROCOPY
 #define MSG_ZEROCOPY 0x4000000
 #endif
@@ -61,11 +105,11 @@ void* handle_client(void* arg) {
     int send_count = 0;
     int max_pending = 1000;
     
-    // Send using sendmsg with MSG_ZEROCOPY flag
+    // Send using sendmsg with MSG_ZEROCOPY flag (use helper to handle partials)
     while (1) {
-        ssize_t sent = sendmsg(client_socket, &msg_hdr, MSG_ZEROCOPY);
+        ssize_t sent = send_iov_all_local(client_socket, iov, NUM_FIELDS, MSG_ZEROCOPY);
         if (sent <= 0) break;
-        
+
         send_count++;
         
         // Poll error queue to check completion notifications
@@ -123,7 +167,7 @@ int main(int argc, char *argv[]) {
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = inet_addr("10.0.0.1");
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     server_addr.sin_port = htons(port);
     
     if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
@@ -138,7 +182,7 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
     
-    printf("A3 Server listening on 10.0.0.1:%d\n", port);
+    printf("A3 Server listening on 0.0.0.0:%d\n", port);
     
     int thread_count = 0;
     while (1) {
