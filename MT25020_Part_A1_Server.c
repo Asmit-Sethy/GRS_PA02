@@ -8,33 +8,42 @@ void* handle_client(void* arg) {
     int field_size = message_size / NUM_FIELDS;
     
     Message *msg = allocate_message(field_size);
-    if (!msg) {
-        fprintf(stderr, "Failed to allocate message\n");
+    // CHANGE 1: Allocate a single linear buffer for the "User Copy"
+    char *linear_buffer = (char*)malloc(message_size);
+
+    if (!msg || !linear_buffer) {
+        fprintf(stderr, "Failed to allocate memory\n");
+        if (msg) free_message(msg);
+        if (linear_buffer) free(linear_buffer);
         close(client_socket);
         free(args);
         return NULL;
     }
     
     while (1) {
-        ssize_t sent;
-        sent = send(client_socket, msg->field1, field_size, 0);
-        if (sent <= 0) break;
-        sent = send(client_socket, msg->field2, field_size, 0);
-        if (sent <= 0) break;
-        sent = send(client_socket, msg->field3, field_size, 0);
-        if (sent <= 0) break;
-        sent = send(client_socket, msg->field4, field_size, 0);
-        if (sent <= 0) break;
-        sent = send(client_socket, msg->field5, field_size, 0);
-        if (sent <= 0) break;
-        sent = send(client_socket, msg->field6, field_size, 0);
-        if (sent <= 0) break;
-        sent = send(client_socket, msg->field7, field_size, 0);
-        if (sent <= 0) break;
-        sent = send(client_socket, msg->field8, field_size, 0);
+        // CHANGE 2: "Two-Copy" Implementation
+        
+        // Copy #1: User-Space Copy
+        // We manually assemble the 8 scattered fields into one contiguous buffer.
+        // This represents the cost of "marshalling" data in real applications.
+        memcpy(linear_buffer + (0 * field_size), msg->field1, field_size);
+        memcpy(linear_buffer + (1 * field_size), msg->field2, field_size);
+        memcpy(linear_buffer + (2 * field_size), msg->field3, field_size);
+        memcpy(linear_buffer + (3 * field_size), msg->field4, field_size);
+        memcpy(linear_buffer + (4 * field_size), msg->field5, field_size);
+        memcpy(linear_buffer + (5 * field_size), msg->field6, field_size);
+        memcpy(linear_buffer + (6 * field_size), msg->field7, field_size);
+        memcpy(linear_buffer + (7 * field_size), msg->field8, field_size);
+
+        // Copy #2: Kernel-Space Copy
+        // We call send() once. The kernel copies data from linear_buffer to the socket buffer.
+        ssize_t sent = send(client_socket, linear_buffer, message_size, 0);
+        
         if (sent <= 0) break;
     }
     
+    // Cleanup
+    free(linear_buffer);
     free_message(msg);
     close(client_socket);
     free(args);
@@ -62,7 +71,7 @@ int main(int argc, char *argv[]) {
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = inet_addr("10.0.0.1");
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     server_addr.sin_port = htons(port);
     
     if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
@@ -77,7 +86,7 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
     
-    printf("A1 Server listening on 10.0.0.1:%d\n", port);
+    printf("A1 Server listening on 0.0.0.0:%d\n", port);
     
     int thread_count = 0;
     while (1) {
