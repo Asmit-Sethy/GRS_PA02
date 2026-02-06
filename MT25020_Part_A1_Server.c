@@ -1,4 +1,3 @@
-// MT25020
 #include "MT25020_Common.h"
 
 void* handle_client(void* arg) {

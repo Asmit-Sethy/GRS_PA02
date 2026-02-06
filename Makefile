@@ -1,4 +1,4 @@
-# MT25020
+# MT25020 --- IGNORE ---
 CC = gcc
 CFLAGS = -Wall -pthread -O2
 TARGETS = MT25020_Part_A1_Server MT25020_Part_A1_Client \

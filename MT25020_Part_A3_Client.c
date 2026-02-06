@@ -1,4 +1,3 @@
-// MT25020
 #include "MT25020_Common.h"
 
 void* client_thread(void* arg) {

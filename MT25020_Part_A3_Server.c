@@ -1,4 +1,3 @@
-// MT25020_Part_A3_Server.c
 #include "MT25020_Common.h"
 #include <sys/uio.h>
 #include <linux/errqueue.h>

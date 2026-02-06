@@ -1,4 +1,3 @@
-// MT25020_Part_A2_Server.c
 #include "MT25020_Common.h"
 #include <sys/uio.h>
 
